@@ -1,0 +1,87 @@
+# Tunnel Core Server Configuration Example
+
+# Agent Listener Configuration
+agent:
+  # Address to listen for agent connections
+  addr: ":8443"
+  
+  # Enable TLS for agent connections (recommended: true)
+  tls: true
+  
+  # TLS certificate file path
+  cert_file: "./certs/agent-cert.pem"
+  
+  # TLS key file path
+  key_file: "./certs/agent-key.pem"
+
+# Public HTTP Listener Configuration
+public:
+  # Address to listen for public HTTP requests
+  addr: ":8080"
+  
+  # Enable TLS for public connections (optional)
+  tls: false
+  
+  # TLS certificate file path (if tls: true)
+  cert_file: "./certs/public-cert.pem"
+  
+  # TLS key file path (if tls: true)
+  key_file: "./certs/public-key.pem"
+
+# Base domain for tunnels
+# Example: if base_domain is "tunnel.example.com"
+# Then tunnels will be: subdomain.tunnel.example.com
+base_domain: "localhost"
+
+# Connection Limits
+limits:
+  # Maximum number of agent connections
+  max_connections: 1000
+  
+  # Maximum concurrent streams globally
+  max_streams: 10000
+  
+  # Heartbeat timeout (seconds)
+  heartbeat_timeout: 30
+  
+  # Authentication timeout (seconds)
+  auth_timeout: 10
+
+# Rate Limiting Configuration
+rate_limiting:
+  # Enable rate limiting
+  enabled: true
+  
+  # Default agent limits (can be overridden per agent)
+  default_agent:
+    max_streams: 100
+    max_bandwidth: 10485760  # 10 MB/s in bytes
+    rate_limit: 100          # requests per second
+  
+  # Default domain limits (can be overridden per domain)
+  default_domain:
+    max_streams: 50
+    rate_limit: 50            # requests per second
+
+# Logging Configuration
+logging:
+  # Log level: debug, info, warn, error
+  level: "info"
+  
+  # Log file path (empty = stdout)
+  file: ""
+  
+  # Enable structured logging (JSON format)
+  structured: false
+
+# Metrics Configuration (future)
+metrics:
+  # Enable metrics collection
+  enabled: false
+  
+  # Metrics endpoint (if enabled)
+  endpoint: "/metrics"
+  
+  # Metrics port
+  port: 9090
+
