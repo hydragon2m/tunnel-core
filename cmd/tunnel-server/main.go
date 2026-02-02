@@ -13,13 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hydragon2m/tunnel-core/internal/connection"
+	"github.com/hydragon2m/tunnel-core/connection"
 	"github.com/hydragon2m/tunnel-core/internal/handshake"
 	"github.com/hydragon2m/tunnel-core/internal/listener"
 	"github.com/hydragon2m/tunnel-core/internal/quota"
 	"github.com/hydragon2m/tunnel-core/internal/registry"
 	"github.com/hydragon2m/tunnel-core/internal/router"
-	"github.com/hydragon2m/tunnel-protocol/go/v1"
+	v1 "github.com/hydragon2m/tunnel-protocol/go/v1"
 )
 
 var (
@@ -86,7 +86,7 @@ func main() {
 	defer cancel()
 
 	// Initialize components
-	connManager := connection.NewManager(*maxConnections, *heartbeatTimeout)
+	connManager := connection.NewManager(*maxConnections, *maxConnections, *heartbeatTimeout)
 	reg := registry.NewRegistry(*baseDomain)
 	limiter := quota.NewLimiter(*maxConnections, 10000) // Max 10000 concurrent streams globally
 
@@ -287,7 +287,7 @@ func handleAgentConnection(
 	connID := fmt.Sprintf("%s-%d", agentID, time.Now().UnixNano())
 
 	// Register connection
-	registeredConn, err := connManager.RegisterConnection(connID, agentID, conn, metadata)
+	registeredConn, err := connManager.RegisterConnection(connID, agentID, "legacy-account", conn, metadata)
 	if err != nil {
 		log.Printf("Failed to register connection: %v", err)
 		return
@@ -303,10 +303,6 @@ func handleAgentConnection(
 // netConnWrapper wraps net.Conn to implement connection.Conn interface
 type netConnWrapper struct {
 	net.Conn
-}
-
-func (w *netConnWrapper) RemoteAddr() string {
-	return w.Conn.RemoteAddr().String()
 }
 
 // parseInt parses string to int

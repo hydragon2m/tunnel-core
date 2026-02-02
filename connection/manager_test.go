@@ -10,7 +10,7 @@ import (
 )
 
 func TestConnectionManager_RegisterConnection(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	// Create mock connection
 	conn1, conn2 := net.Pipe()
@@ -20,7 +20,7 @@ func TestConnectionManager_RegisterConnection(t *testing.T) {
 	// Create Conn wrapper
 	connWrapper := &mockConn{conn: conn1}
 
-	conn, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, map[string]string{"version": "1.0.0"})
+	conn, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, map[string]string{"version": "1.0.0"})
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -59,12 +59,12 @@ func (m *mockConn) SetWriteDeadline(t time.Time) error {
 	return m.conn.SetWriteDeadline(t)
 }
 
-func (m *mockConn) RemoteAddr() string {
-	return m.conn.RemoteAddr().String()
+func (m *mockConn) RemoteAddr() net.Addr {
+	return m.conn.RemoteAddr()
 }
 
 func TestConnectionManager_GetConnection(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -72,7 +72,7 @@ func TestConnectionManager_GetConnection(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	_, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	_, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestConnectionManager_GetConnection(t *testing.T) {
 }
 
 func TestConnectionManager_CloseConnection(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -102,7 +102,7 @@ func TestConnectionManager_CloseConnection(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	_, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	_, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestConnectionManager_CloseConnection(t *testing.T) {
 }
 
 func TestConnection_CreateStream(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -127,7 +127,7 @@ func TestConnection_CreateStream(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	conn, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	conn, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestConnection_CreateStream(t *testing.T) {
 }
 
 func TestConnection_GetStream(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -156,7 +156,7 @@ func TestConnection_GetStream(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	conn, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	conn, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestConnection_GetStream(t *testing.T) {
 }
 
 func TestConnection_CloseStream(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -197,7 +197,7 @@ func TestConnection_CloseStream(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	conn, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	conn, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestConnection_CloseStream(t *testing.T) {
 }
 
 func TestConnection_Heartbeat(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -226,7 +226,7 @@ func TestConnection_Heartbeat(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	conn, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	conn, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestConnection_Heartbeat(t *testing.T) {
 }
 
 func TestConnectionManager_ConcurrentAccess(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	var wg sync.WaitGroup
 	numGoroutines := 10
@@ -265,7 +265,7 @@ func TestConnectionManager_ConcurrentAccess(t *testing.T) {
 			connWrapper := &mockConn{conn: conn1}
 			connID := "conn-" + string(rune(id))
 			agentID := "agent-" + string(rune(id))
-			_, err := cm.RegisterConnection(connID, agentID, connWrapper, nil)
+			_, err := cm.RegisterConnection(connID, agentID, "account-1", connWrapper, nil)
 			if err != nil {
 				t.Errorf("RegisterConnection failed: %v", err)
 			}
@@ -286,7 +286,7 @@ func TestConnectionManager_ConcurrentAccess(t *testing.T) {
 }
 
 func TestConnection_ConcurrentStreams(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -294,7 +294,7 @@ func TestConnection_ConcurrentStreams(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	conn, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	conn, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestConnection_ConcurrentStreams(t *testing.T) {
 }
 
 func TestConnection_Context(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -336,7 +336,7 @@ func TestConnection_Context(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	conn, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	conn, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestConnection_Context(t *testing.T) {
 }
 
 func TestConnection_SendFrame(t *testing.T) {
-	cm := NewManager(100, 30*time.Second)
+	cm := NewManager(100, 10, 30*time.Second)
 
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
@@ -364,7 +364,7 @@ func TestConnection_SendFrame(t *testing.T) {
 
 	connWrapper := &mockConn{conn: conn1}
 
-	conn, err := cm.RegisterConnection("conn-1", "agent-1", connWrapper, nil)
+	conn, err := cm.RegisterConnection("conn-1", "agent-1", "account-1", connWrapper, nil)
 	if err != nil {
 		t.Fatalf("RegisterConnection failed: %v", err)
 	}

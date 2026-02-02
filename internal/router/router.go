@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hydragon2m/tunnel-core/internal/connection"
+	"github.com/hydragon2m/tunnel-core/connection"
 	"github.com/hydragon2m/tunnel-core/internal/quota"
 	"github.com/hydragon2m/tunnel-core/internal/registry"
-	"github.com/hydragon2m/tunnel-protocol/go/v1"
+	v1 "github.com/hydragon2m/tunnel-protocol/go/v1"
 )
 
 // Router route HTTP requests đến agent connections

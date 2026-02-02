@@ -2,6 +2,8 @@ package connection
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -13,6 +15,7 @@ type Connection struct {
 	ID            string
 	Conn          Conn // net.Conn wrapper với timeout support
 	AgentID       string
+	AccountID     string // Tenant/Account ID
 	Metadata      map[string]string
 	CreatedAt     time.Time
 	LastHeartbeat time.Time
@@ -23,10 +26,13 @@ type Connection struct {
 	nextStreamID uint32
 
 	// State
-	ctx      context.Context
-	cancel   context.CancelFunc
-	closed   bool
-	closedMu sync.RWMutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	state   ConnectionState
+	stateMu sync.RWMutex
+
+	// Callbacks
+	onStateChange func(oldState, newState ConnectionState)
 }
 
 // Conn là interface cho network connection với timeout support
@@ -36,7 +42,7 @@ type Conn interface {
 	Close() error
 	SetReadDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error
-	RemoteAddr() string
+	RemoteAddr() net.Addr
 }
 
 // Stream đại diện cho 1 stream trên connection
@@ -67,36 +73,49 @@ const (
 
 // Manager quản lý tất cả connections từ agents
 type Manager struct {
-	connections map[string]*Connection // agentID -> Connection
-	connsMu     sync.RWMutex
+	connections  map[string]*Connection // connectionID -> Connection
+	accountConns map[string]int         // accountID -> count
+	connsMu      sync.RWMutex
 
 	// Config
-	maxConnections   int
-	heartbeatTimeout time.Duration
+	maxConnections           int
+	maxConnectionsPerAccount int
+	heartbeatTimeout         time.Duration
 
 	// Callbacks
-	onConnectionClosed func(connID string)
-	onStreamCreated    func(connID string, streamID uint32)
-	onStreamClosed     func(connID string, streamID uint32)
+	onConnectionClosed      func(connID string)
+	onConnectionStateChange func(connID string, oldState, newState ConnectionState)
+	onStreamCreated         func(connID string, streamID uint32)
+	onStreamClosed          func(connID string, streamID uint32)
 }
 
 // NewManager tạo Connection Manager mới
-func NewManager(maxConnections int, heartbeatTimeout time.Duration) *Manager {
+func NewManager(maxConnections, maxConnectionsPerAccount int, heartbeatTimeout time.Duration) *Manager {
+	if maxConnectionsPerAccount <= 0 {
+		maxConnectionsPerAccount = maxConnections // Default to global limit if not set
+	}
 	return &Manager{
-		connections:      make(map[string]*Connection),
-		maxConnections:   maxConnections,
-		heartbeatTimeout: heartbeatTimeout,
+		connections:              make(map[string]*Connection),
+		accountConns:             make(map[string]int),
+		maxConnections:           maxConnections,
+		maxConnectionsPerAccount: maxConnectionsPerAccount,
+		heartbeatTimeout:         heartbeatTimeout,
 	}
 }
 
 // RegisterConnection đăng ký connection mới từ agent
-func (m *Manager) RegisterConnection(connID, agentID string, conn Conn, metadata map[string]string) (*Connection, error) {
+func (m *Manager) RegisterConnection(connID, agentID, accountID string, conn Conn, metadata map[string]string) (*Connection, error) {
 	m.connsMu.Lock()
 	defer m.connsMu.Unlock()
 
 	// Check max connections
 	if len(m.connections) >= m.maxConnections {
 		return nil, ErrMaxConnections
+	}
+
+	// Check account limit
+	if m.accountConns[accountID] >= m.maxConnectionsPerAccount {
+		return nil, fmt.Errorf("max connections limit reached for account %s", accountID)
 	}
 
 	// Check duplicate
@@ -110,6 +129,7 @@ func (m *Manager) RegisterConnection(connID, agentID string, conn Conn, metadata
 		ID:            connID,
 		Conn:          conn,
 		AgentID:       agentID,
+		AccountID:     accountID,
 		Metadata:      metadata,
 		CreatedAt:     time.Now(),
 		LastHeartbeat: time.Now(),
@@ -117,9 +137,23 @@ func (m *Manager) RegisterConnection(connID, agentID string, conn Conn, metadata
 		nextStreamID:  1, // Start from 1, 0 is for control
 		ctx:           ctx,
 		cancel:        cancel,
+		state:         StateInit,
 	}
 
+	// Setup state change callback
+	c.onStateChange = func(oldState, newState ConnectionState) {
+		m.connsMu.RLock()
+		callback := m.onConnectionStateChange
+		m.connsMu.RUnlock()
+		if callback != nil {
+			callback(connID, oldState, newState)
+		}
+	}
+
+	c.state = StateConnected // Set initial state to Connected
+
 	m.connections[connID] = c
+	m.accountConns[accountID]++
 
 	// Start connection handler
 	go m.handleConnection(c)
@@ -149,11 +183,30 @@ func (m *Manager) GetConnectionByAgentID(agentID string) (*Connection, bool) {
 	return nil, false
 }
 
+// GetAllConnections returns all active connections
+func (m *Manager) GetAllConnections() []*Connection {
+	m.connsMu.RLock()
+	defer m.connsMu.RUnlock()
+
+	conns := make([]*Connection, 0, len(m.connections))
+	for _, conn := range m.connections {
+		conns = append(conns, conn)
+	}
+	return conns
+}
+
 // SetOnConnectionClosed set callback khi connection đóng
 func (m *Manager) SetOnConnectionClosed(callback func(connID string)) {
 	m.connsMu.Lock()
 	defer m.connsMu.Unlock()
 	m.onConnectionClosed = callback
+}
+
+// SetOnConnectionStateChange set callback khi connection state thay đổi
+func (m *Manager) SetOnConnectionStateChange(callback func(connID string, oldState, newState ConnectionState)) {
+	m.connsMu.Lock()
+	defer m.connsMu.Unlock()
+	m.onConnectionStateChange = callback
 }
 
 // SetOnStreamCreated set callback khi stream được tạo
@@ -176,6 +229,10 @@ func (m *Manager) CloseConnection(connID string) error {
 	conn, exists := m.connections[connID]
 	if exists {
 		delete(m.connections, connID)
+		m.accountConns[conn.AccountID]--
+		if m.accountConns[conn.AccountID] <= 0 {
+			delete(m.accountConns, conn.AccountID)
+		}
 	}
 	m.connsMu.Unlock()
 
@@ -194,6 +251,11 @@ func (m *Manager) CloseConnection(connID string) error {
 
 // handleConnection xử lý frames từ connection
 func (m *Manager) handleConnection(c *Connection) {
+	// Set initial state
+	if err := c.SetState(StateConnected); err != nil {
+		c.Close()
+		return
+	}
 	defer c.Close()
 
 	// Heartbeat checker
@@ -391,25 +453,29 @@ func (c *Connection) AllocateStreamID() uint32 {
 
 // SendFrame gửi frame đến agent
 func (c *Connection) SendFrame(frame *v1.Frame) error {
-	c.closedMu.RLock()
-	if c.closed {
-		c.closedMu.RUnlock()
+	c.stateMu.RLock()
+	// Allow sending if Connected or Authenticated
+	if c.state != StateConnected && c.state != StateAuthenticated {
+		c.stateMu.RUnlock()
 		return ErrConnectionClosed
 	}
-	c.closedMu.RUnlock()
+	c.stateMu.RUnlock()
 
 	return v1.Encode(c.Conn, frame)
 }
 
 // Close đóng connection
 func (c *Connection) Close() error {
-	c.closedMu.Lock()
-	if c.closed {
-		c.closedMu.Unlock()
+	c.stateMu.Lock()
+	if c.state == StateClosed || c.state == StateClosing {
+		c.stateMu.Unlock()
 		return nil
 	}
-	c.closed = true
-	c.closedMu.Unlock()
+	// Transition to Closing? Or directly Closed?
+	// For simplicity, goes to Closed, but if we have async cleanup, Closing is better.
+	// Since Close() does synchronous cleanup here, we can set Closed immediately or Closing then Closed.
+	c.state = StateClosed
+	c.stateMu.Unlock()
 
 	c.cancel()
 
@@ -425,8 +491,8 @@ func (c *Connection) Close() error {
 
 // updateHeartbeat cập nhật heartbeat timestamp
 func (c *Connection) updateHeartbeat() {
-	c.closedMu.Lock()
-	defer c.closedMu.Unlock()
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	c.LastHeartbeat = time.Now()
 }
 
@@ -452,6 +518,40 @@ func (s *Stream) DataIn() <-chan []byte {
 // CloseCh returns the close channel
 func (s *Stream) CloseCh() <-chan struct{} {
 	return s.closeCh
+}
+
+// SetState transitions the connection to a new state
+func (c *Connection) SetState(newState ConnectionState) error {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+
+	if c.state == newState {
+		return nil
+	}
+
+	if !IsValidTransition(c.state, newState) {
+		return fmt.Errorf("invalid state transition from %s to %s", c.state, newState)
+	}
+
+	c.state = newState
+
+	// Trigger callback explicitly outside the lock to avoid deadlocks?
+	// Ideally yes, but here we just hold stateMu. callback calls Manager which holds connsMu.
+	// If Manager callbacks call back into Connection methods that need stateMu, we deadlock.
+	// Safe practice: define callback to NOT call back into Connection synchronosly or be careful.
+	// For now, simple invocation.
+	if c.onStateChange != nil {
+		c.onStateChange(c.state, newState)
+	}
+
+	return nil
+}
+
+// GetState returns the current connection state
+func (c *Connection) GetState() ConnectionState {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.state
 }
 
 // Context returns context for connection (for cancellation)
