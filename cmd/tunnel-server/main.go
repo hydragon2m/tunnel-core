@@ -9,28 +9,29 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/hydragon2m/tunnel-protocol/go/v1"
 	"github.com/hydragon2m/tunnel-core/internal/connection"
 	"github.com/hydragon2m/tunnel-core/internal/handshake"
 	"github.com/hydragon2m/tunnel-core/internal/listener"
 	"github.com/hydragon2m/tunnel-core/internal/quota"
 	"github.com/hydragon2m/tunnel-core/internal/registry"
 	"github.com/hydragon2m/tunnel-core/internal/router"
+	"github.com/hydragon2m/tunnel-protocol/go/v1"
 )
 
 var (
 	// Agent listener config
 	agentAddr     = flag.String("agent-addr", ":8443", "Address to listen for agent connections")
 	agentTLS      = flag.Bool("agent-tls", true, "Enable TLS for agent connections")
-	agentCertFile  = flag.String("agent-cert", "", "TLS certificate file for agent connections")
-	agentKeyFile   = flag.String("agent-key", "", "TLS key file for agent connections")
+	agentCertFile = flag.String("agent-cert", "", "TLS certificate file for agent connections")
+	agentKeyFile  = flag.String("agent-key", "", "TLS key file for agent connections")
 
 	// Public listener config
-	publicAddr    = flag.String("public-addr", ":8080", "Address to listen for public HTTP requests")
-	publicTLS     = flag.Bool("public-tls", false, "Enable TLS for public connections")
+	publicAddr     = flag.String("public-addr", ":8080", "Address to listen for public HTTP requests")
+	publicTLS      = flag.Bool("public-tls", false, "Enable TLS for public connections")
 	publicCertFile = flag.String("public-cert", "", "TLS certificate file for public connections")
 	publicKeyFile  = flag.String("public-key", "", "TLS key file for public connections")
 
@@ -38,13 +39,43 @@ var (
 	baseDomain = flag.String("base-domain", "localhost", "Base domain for tunnels")
 
 	// Config
-	maxConnections    = flag.Int("max-connections", 1000, "Maximum number of agent connections")
-	heartbeatTimeout  = flag.Duration("heartbeat-timeout", 30*time.Second, "Heartbeat timeout")
-	authTimeout       = flag.Duration("auth-timeout", 10*time.Second, "Authentication timeout")
+	maxConnections   = flag.Int("max-connections", 1000, "Maximum number of agent connections")
+	heartbeatTimeout = flag.Duration("heartbeat-timeout", 30*time.Second, "Heartbeat timeout")
+	authTimeout      = flag.Duration("auth-timeout", 10*time.Second, "Authentication timeout")
 )
 
 func main() {
 	flag.Parse()
+
+	// Override with environment variables if set
+	if envAddr := os.Getenv("AGENT_ADDR"); envAddr != "" {
+		*agentAddr = envAddr
+	}
+	if envTLS := os.Getenv("AGENT_TLS"); envTLS != "" {
+		*agentTLS = (envTLS == "true")
+	}
+	if envCert := os.Getenv("AGENT_CERT"); envCert != "" {
+		*agentCertFile = envCert
+	}
+	if envKey := os.Getenv("AGENT_KEY"); envKey != "" {
+		*agentKeyFile = envKey
+	}
+	if envPublicAddr := os.Getenv("PUBLIC_ADDR"); envPublicAddr != "" {
+		*publicAddr = envPublicAddr
+	}
+	if envBaseDomain := os.Getenv("BASE_DOMAIN"); envBaseDomain != "" {
+		*baseDomain = envBaseDomain
+	}
+	if envMaxConn := os.Getenv("MAX_CONNECTIONS"); envMaxConn != "" {
+		if maxConn, err := parseInt(envMaxConn); err == nil {
+			*maxConnections = maxConn
+		}
+	}
+	if envHeartbeat := os.Getenv("HEARTBEAT_TIMEOUT"); envHeartbeat != "" {
+		if timeout, err := time.ParseDuration(envHeartbeat); err == nil {
+			*heartbeatTimeout = timeout
+		}
+	}
 
 	// Setup logging
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -276,4 +307,9 @@ type netConnWrapper struct {
 
 func (w *netConnWrapper) RemoteAddr() string {
 	return w.Conn.RemoteAddr().String()
+}
+
+// parseInt parses string to int
+func parseInt(s string) (int, error) {
+	return strconv.Atoi(s)
 }

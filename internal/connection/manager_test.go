@@ -240,7 +240,7 @@ func TestConnection_Heartbeat(t *testing.T) {
 	// Wait a bit and update again (using private method via reflection or direct field access)
 	time.Sleep(10 * time.Millisecond)
 	conn.updateHeartbeat()
-	
+
 	newHeartbeat := conn.LastHeartbeat
 	if !newHeartbeat.After(initialHeartbeat) {
 		t.Error("Expected new heartbeat to be after old heartbeat")
@@ -396,4 +396,3 @@ func TestConnection_SendFrame(t *testing.T) {
 		t.Errorf("Expected FrameHeartbeat, got %d", receivedFrame.Type)
 	}
 }
-

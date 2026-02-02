@@ -206,4 +206,3 @@ func TestTunnel_LastAccess(t *testing.T) {
 		t.Error("Expected LastAccess to not be before initial")
 	}
 }
-

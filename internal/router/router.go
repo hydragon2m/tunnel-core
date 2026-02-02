@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hydragon2m/tunnel-protocol/go/v1"
 	"github.com/hydragon2m/tunnel-core/internal/connection"
 	"github.com/hydragon2m/tunnel-core/internal/quota"
 	"github.com/hydragon2m/tunnel-core/internal/registry"
+	"github.com/hydragon2m/tunnel-protocol/go/v1"
 )
 
 // Router route HTTP requests đến agent connections
@@ -34,6 +34,13 @@ func NewRouter(reg *registry.Registry, connManager *connection.Manager, limiter 
 
 // ServeHTTP implements http.Handler
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Health check endpoint
+	if req.URL.Path == "/health" {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+		return
+	}
+
 	// Extract domain from Host header
 	host := req.Host
 	if host == "" {
@@ -223,4 +230,3 @@ func (r *Router) waitForResponse(
 
 	return nil
 }
-

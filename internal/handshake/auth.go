@@ -11,27 +11,27 @@ import (
 type Authenticator struct {
 	// Token validator
 	validateToken func(token string) (agentID string, err error)
-	
+
 	// Config
 	authTimeout time.Duration
 }
 
 // AuthRequest là payload của FrameAuth từ agent
 type AuthRequest struct {
-	Token      string            `json:"token"`
-	AgentID    string            `json:"agent_id,omitempty"`
-	Version    string            `json:"version,omitempty"`
-	Capabilities []string        `json:"capabilities,omitempty"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
+	Token        string            `json:"token"`
+	AgentID      string            `json:"agent_id,omitempty"`
+	Version      string            `json:"version,omitempty"`
+	Capabilities []string          `json:"capabilities,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
 }
 
 // AuthResponse là payload của FrameAuth response từ server
 type AuthResponse struct {
-	Success    bool              `json:"success"`
-	AgentID    string            `json:"agent_id,omitempty"`
-	ServerTime int64             `json:"server_time,omitempty"`
+	Success    bool                   `json:"success"`
+	AgentID    string                 `json:"agent_id,omitempty"`
+	ServerTime int64                  `json:"server_time,omitempty"`
 	Config     map[string]interface{} `json:"config,omitempty"`
-	Error      string            `json:"error,omitempty"`
+	Error      string                 `json:"error,omitempty"`
 }
 
 // NewAuthenticator tạo Authenticator mới
@@ -49,31 +49,31 @@ func (a *Authenticator) HandleAuth(frame *v1.Frame) (agentID string, metadata ma
 	if frame.Type != v1.FrameAuth {
 		return "", nil, ErrInvalidFrameType
 	}
-	
+
 	// Validate control frame
 	if !frame.IsControlFrame() {
 		return "", nil, ErrAuthMustBeControlFrame
 	}
-	
+
 	// Parse auth request
 	var req AuthRequest
 	if err := json.Unmarshal(frame.Payload, &req); err != nil {
 		return "", nil, ErrInvalidAuthPayload
 	}
-	
+
 	// Validate token
 	if a.validateToken == nil {
 		return "", nil, ErrNoTokenValidator
 	}
-	
+
 	validatedAgentID, err := a.validateToken(req.Token)
 	if err != nil {
 		return "", nil, err
 	}
-	
+
 	// Use validated agent ID (server is source of truth)
 	agentID = validatedAgentID
-	
+
 	// Build metadata
 	metadata = make(map[string]string)
 	if req.AgentID != "" {
@@ -82,18 +82,18 @@ func (a *Authenticator) HandleAuth(frame *v1.Frame) (agentID string, metadata ma
 	if req.Version != "" {
 		metadata["client_version"] = req.Version
 	}
-	
+
 	// Add capabilities to metadata
 	if len(req.Capabilities) > 0 {
 		capabilitiesJSON, _ := json.Marshal(req.Capabilities)
 		metadata["capabilities"] = string(capabilitiesJSON)
 	}
-	
+
 	// Merge additional metadata
 	for k, v := range req.Metadata {
 		metadata[k] = v
 	}
-	
+
 	return agentID, metadata, nil
 }
 
@@ -105,16 +105,16 @@ func (a *Authenticator) CreateAuthResponse(success bool, agentID string, config 
 		ServerTime: time.Now().Unix(),
 		Config:     config,
 	}
-	
+
 	if !success {
 		resp.Error = errMsg
 	}
-	
+
 	payload, err := json.Marshal(resp)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &v1.Frame{
 		Version:  v1.Version,
 		Type:     v1.FrameAuth,
@@ -133,4 +133,3 @@ func (a *Authenticator) CreateAuthSuccessResponse(agentID string, config map[str
 func (a *Authenticator) CreateAuthErrorResponse(errMsg string) (*v1.Frame, error) {
 	return a.CreateAuthResponse(false, "", nil, errMsg)
 }
-

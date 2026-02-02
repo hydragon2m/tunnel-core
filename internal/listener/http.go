@@ -102,4 +102,3 @@ func (l *HTTPListener) Addr() net.Addr {
 	}
 	return nil
 }
-
