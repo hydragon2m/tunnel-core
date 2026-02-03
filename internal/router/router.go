@@ -20,6 +20,7 @@ type Router struct {
 	connManager *connection.Manager
 	limiter     *quota.Limiter
 	timeout     time.Duration
+	onRequest   func(accountID string, duration time.Duration, success bool)
 }
 
 // NewRouter tạo Router mới
@@ -30,6 +31,11 @@ func NewRouter(reg *registry.Registry, connManager *connection.Manager, limiter 
 		limiter:     limiter,
 		timeout:     timeout,
 	}
+}
+
+// SetOnRequest đặt callback khi xử lý xong request
+func (r *Router) SetOnRequest(callback func(accountID string, duration time.Duration, success bool)) {
+	r.onRequest = callback
 }
 
 // ServeHTTP implements http.Handler
@@ -88,7 +94,16 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer cancel()
 
 	// Handle request
-	if err := r.handleRequest(ctx, conn, streamID, w, req); err != nil {
+	start := time.Now()
+	err := r.handleRequest(ctx, conn, streamID, w, req)
+	duration := time.Since(start)
+
+	success := (err == nil)
+	if r.onRequest != nil {
+		r.onRequest(conn.AccountID, duration, success)
+	}
+
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -102,10 +117,10 @@ func (r *Router) handleRequest(
 	w http.ResponseWriter,
 	req *http.Request,
 ) error {
-	// Build request payload (simplified - can be enhanced with full HTTP serialization)
+	// 1. Build request payload (Headers)
 	requestData := r.buildRequestPayload(req)
 
-	// Send FrameOpenStream
+	// 2. Open Stream with Headers
 	openFrame := &v1.Frame{
 		Version:  v1.Version,
 		Type:     v1.FrameOpenStream,
@@ -118,69 +133,39 @@ func (r *Router) handleRequest(
 		return fmt.Errorf("failed to send open stream frame: %w", err)
 	}
 
-	// Get stream
+	// 3. Get stream
 	stream, ok := conn.GetStream(streamID)
 	if !ok {
 		return fmt.Errorf("stream not found after creation")
 	}
+	defer stream.Close()
 
-	// Forward request body if present
+	// 4. Stream request body if present (Async)
 	if req.Body != nil {
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read request body: %w", err)
-		}
-
-		if len(body) > 0 {
-			dataFrame := &v1.Frame{
-				Version:  v1.Version,
-				Type:     v1.FrameData,
-				Flags:    v1.FlagNone,
-				StreamID: streamID,
-				Payload:  body,
-			}
-
-			if err := conn.SendFrame(dataFrame); err != nil {
-				return fmt.Errorf("failed to send request body: %w", err)
-			}
-		}
+		go func() {
+			// io.Copy will call Stream.Write which sends FrameData
+			_, _ = io.Copy(stream, req.Body)
+			_ = req.Body.Close()
+			// EndStream flag is sent by stream.Close() via defer above
+		}()
 	}
 
-	// Send EndStream flag to indicate request complete
-	endFrame := &v1.Frame{
-		Version:  v1.Version,
-		Type:     v1.FrameData,
-		Flags:    v1.FlagEndStream,
-		StreamID: streamID,
-		Payload:  nil,
-	}
-
-	if err := conn.SendFrame(endFrame); err != nil {
-		return fmt.Errorf("failed to send end stream frame: %w", err)
-	}
-
-	// Wait for response from stream
-	return r.waitForResponse(ctx, stream, streamID, w)
+	// 5. Wait for response and stream back to client
+	return r.waitForResponse(ctx, stream, w)
 }
 
 // buildRequestPayload builds request payload from HTTP request
 func (r *Router) buildRequestPayload(req *http.Request) []byte {
-	// Simplified payload - can be enhanced with full HTTP/1.1 serialization
-	// Format: "METHOD PATH HTTP/1.1\r\nHeaders\r\n\r\n"
 	var buf bytes.Buffer
-
 	// Request line
-	buf.WriteString(fmt.Sprintf("%s %s %s\r\n", req.Method, req.URL.Path, req.Proto))
-
+	buf.WriteString(fmt.Sprintf("%s %s %s\r\n", req.Method, req.URL.RequestURI(), req.Proto))
 	// Headers
 	for key, values := range req.Header {
 		for _, value := range values {
 			buf.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
 		}
 	}
-
 	buf.WriteString("\r\n")
-
 	return buf.Bytes()
 }
 
@@ -188,44 +173,22 @@ func (r *Router) buildRequestPayload(req *http.Request) []byte {
 func (r *Router) waitForResponse(
 	ctx context.Context,
 	stream *connection.Stream,
-	streamID uint32,
 	w http.ResponseWriter,
 ) error {
-	// Read response data from stream
-	responseData := make([]byte, 0)
-	streamClosed := false
+	// In a real implementation, we should parse the HTTP response headers
+	// from the agent here. For now, since the current protocol sends raw
+	// response data (assumed to be full HTTP response), we just copy.
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
+	// TODO: Parse actual HTTP Status and Headers from the stream.
+	// For now, we assume the agent sends a full HTTP response.
 
-		case data, ok := <-stream.DataIn():
-			if !ok {
-				streamClosed = true
-				break
-			}
-			responseData = append(responseData, data...)
+	// We use a small heuristic: If the first few bytes look like "HTTP/",
+	// we might need to parse it. But the current implementation just writes raw.
 
-		case <-stream.CloseCh():
-			streamClosed = true
-			break
-		}
-
-		if streamClosed {
-			break
-		}
-	}
-
-	// Parse and write response (simplified - assumes response is already HTTP formatted)
-	// In production, should parse HTTP response from agent
-	if len(responseData) > 0 {
-		// For now, just write raw response
-		// TODO: Parse HTTP response headers and status
-		w.WriteHeader(http.StatusOK)
-		w.Write(responseData)
-	} else {
-		w.WriteHeader(http.StatusNoContent)
+	// Stream from tunnel back to end-user
+	_, err := io.Copy(w, stream)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("failed to stream response: %w", err)
 	}
 
 	return nil

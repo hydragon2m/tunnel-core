@@ -3,6 +3,7 @@ package connection
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -33,6 +34,8 @@ type Connection struct {
 
 	// Callbacks
 	onStateChange func(oldState, newState ConnectionState)
+
+	manager *Manager // Reference to parent manager for callbacks
 }
 
 // Conn là interface cho network connection với timeout support
@@ -54,10 +57,13 @@ type Stream struct {
 
 	// Data channels
 	dataIn  chan []byte
-	dataOut chan []byte
 	closeCh chan struct{}
 
-	mu sync.RWMutex
+	conn *Connection // Reference to parent connection for writing
+	mu   sync.RWMutex
+
+	// Internal read buffer for Read interface
+	readBuf []byte
 }
 
 // StreamState là state của stream
@@ -87,6 +93,9 @@ type Manager struct {
 	onConnectionStateChange func(connID string, oldState, newState ConnectionState)
 	onStreamCreated         func(connID string, streamID uint32)
 	onStreamClosed          func(connID string, streamID uint32)
+
+	// Metrics & Observability
+	onTraffic func(accountID string, bytesIn, bytesOut int64)
 }
 
 // NewManager tạo Connection Manager mới
@@ -138,6 +147,7 @@ func (m *Manager) RegisterConnection(connID, agentID, accountID string, conn Con
 		ctx:           ctx,
 		cancel:        cancel,
 		state:         StateInit,
+		manager:       m,
 	}
 
 	// Setup state change callback
@@ -209,6 +219,13 @@ func (m *Manager) SetOnConnectionStateChange(callback func(connID string, oldSta
 	m.onConnectionStateChange = callback
 }
 
+// SetOnTraffic set callback khi có traffic
+func (m *Manager) SetOnTraffic(callback func(accountID string, bytesIn, bytesOut int64)) {
+	m.connsMu.Lock()
+	defer m.connsMu.Unlock()
+	m.onTraffic = callback
+}
+
 // SetOnStreamCreated set callback khi stream được tạo
 func (m *Manager) SetOnStreamCreated(callback func(connID string, streamID uint32)) {
 	m.connsMu.Lock()
@@ -267,19 +284,57 @@ func (m *Manager) handleConnection(c *Connection) {
 
 	// Frame reading goroutine
 	frameCh := make(chan *v1.Frame, 10)
-	errCh := make(chan error, 1)
-
 	go func() {
+		defer c.Close()
 		for {
-			// Set read deadline để tránh block vô hạn
+			// Set read deadline
 			c.Conn.SetReadDeadline(time.Now().Add(m.heartbeatTimeout))
 
-			// Decode frame
-			frame, err := v1.Decode(c.Conn)
+			// 1. Read Length (4 bytes)
+			length, err := v1.ReadFrameLength(c.Conn)
 			if err != nil {
-				errCh <- err
 				return
 			}
+
+			// 2. Get Buffer from Pool
+			buf := v1.GetBuffer(int(length))
+
+			// 3. Read Frame Body
+			if _, err := io.ReadFull(c.Conn, buf[:length]); err != nil {
+				v1.PutBuffer(buf)
+				return
+			}
+
+			// 4. Parse Frame
+			frame, err := v1.ParseFrame(buf[:length])
+			if err != nil {
+				v1.PutBuffer(buf)
+				return
+			}
+
+			// 5. Optimization: Handle heartbeat immediately to avoid false timeouts
+			if frame.Type == v1.FrameHeartbeat {
+				c.updateHeartbeat()
+				// Send Heartbeat ACK back immediately if it's the Core
+				// ACK: Version=1, Type=Heartbeat, Flags=Ack, StreamID=0
+				ack := &v1.Frame{
+					Version:  v1.Version,
+					Type:     v1.FrameHeartbeat,
+					Flags:    v1.FlagAck,
+					StreamID: 0,
+				}
+				_ = v1.Encode(c.Conn, ack)
+				v1.PutBuffer(buf)
+				continue
+			}
+
+			// 6. Copy payload if needed for async processing and return buffer to pool
+			if len(frame.Payload) > 0 {
+				newPayload := make([]byte, len(frame.Payload))
+				copy(newPayload, frame.Payload)
+				frame.Payload = newPayload
+			}
+			v1.PutBuffer(buf)
 
 			select {
 			case frameCh <- frame:
@@ -296,7 +351,10 @@ func (m *Manager) handleConnection(c *Connection) {
 
 		case <-ticker.C:
 			// Check heartbeat timeout
-			if time.Since(c.LastHeartbeat) > m.heartbeatTimeout {
+			c.stateMu.RLock()
+			lastHB := c.LastHeartbeat
+			c.stateMu.RUnlock()
+			if time.Since(lastHB) > m.heartbeatTimeout {
 				return // Connection timeout
 			}
 
@@ -305,11 +363,6 @@ func (m *Manager) handleConnection(c *Connection) {
 			if err := m.handleFrame(c, frame); err != nil {
 				return // Protocol error
 			}
-
-		case err := <-errCh:
-			// Connection error
-			_ = err
-			return
 		}
 	}
 }
@@ -412,9 +465,9 @@ func (c *Connection) createStream(streamID uint32) *Stream {
 		State:     StreamStateInit,
 		CreatedAt: time.Now(),
 		Metadata:  make(map[string]string),
-		dataIn:    make(chan []byte, 10),
-		dataOut:   make(chan []byte, 10),
+		dataIn:    make(chan []byte, 100),
 		closeCh:   make(chan struct{}),
+		conn:      c,
 	}
 
 	c.streams[streamID] = stream
@@ -514,8 +567,78 @@ func (s *Stream) GetState() StreamState {
 }
 
 // DataIn returns the data input channel
-func (s *Stream) DataIn() <-chan []byte {
+func (s *Stream) DataIn() chan<- []byte {
 	return s.dataIn
+}
+
+// Read implements io.Reader
+func (s *Stream) Read(p []byte) (n int, err error) {
+	if s.readBuf != nil && len(s.readBuf) > 0 {
+		n = copy(p, s.readBuf)
+		s.readBuf = s.readBuf[n:]
+		return n, nil
+	}
+
+	select {
+	case data, ok := <-s.dataIn:
+		if !ok {
+			return 0, io.EOF
+		}
+		n = copy(p, data)
+		if n < len(data) {
+			s.readBuf = data[n:]
+		}
+
+		// Report traffic (dataIn is ingress from agent -> server -> end-user, so it's BytesIn from agent perspective, but BytesOut from server perspective?)
+		// Let's clarify: BytesIn = end-user -> server -> agent. BytesOut = agent -> server -> end-user.
+		// Stream.Read is called by Router to read from agent and write to end-user. So this is data from agent (BytesOut).
+		if s.conn.manager != nil && s.conn.manager.onTraffic != nil {
+			s.conn.manager.onTraffic(s.conn.AccountID, 0, int64(n))
+		}
+
+		return n, nil
+	case <-s.closeCh:
+		return 0, io.EOF
+	case <-s.conn.ctx.Done():
+		return 0, s.conn.ctx.Err()
+	}
+}
+
+// Write implements io.Writer
+func (s *Stream) Write(p []byte) (n int, err error) {
+	// Send FrameData
+	frame := &v1.Frame{
+		Version:  v1.Version,
+		Type:     v1.FrameData,
+		Flags:    v1.FlagNone,
+		StreamID: s.ID,
+		Payload:  p,
+	}
+
+	if err := s.conn.SendFrame(frame); err != nil {
+		return 0, err
+	}
+
+	// Report traffic: Stream.Write is called by Router to write data from end-user to agent (BytesIn).
+	if s.conn.manager != nil && s.conn.manager.onTraffic != nil {
+		s.conn.manager.onTraffic(s.conn.AccountID, int64(len(p)), 0)
+	}
+
+	return len(p), nil
+}
+
+// Close implements io.Closer
+func (s *Stream) Close() error {
+	// Send EndStream frame
+	frame := &v1.Frame{
+		Version:  v1.Version,
+		Type:     v1.FrameData,
+		Flags:    v1.FlagEndStream,
+		StreamID: s.ID,
+		Payload:  nil,
+	}
+	_ = s.conn.SendFrame(frame)
+	return nil
 }
 
 // CloseCh returns the close channel
