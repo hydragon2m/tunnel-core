@@ -251,6 +251,9 @@ func (m *Manager) CloseConnection(connID string) error {
 
 // handleConnection xử lý frames từ connection
 func (m *Manager) handleConnection(c *Connection) {
+	// Ensure connection is cleaned up when this function exits
+	defer m.CloseConnection(c.ID)
+
 	// Set initial state
 	if err := c.SetState(StateConnected); err != nil {
 		c.Close()
