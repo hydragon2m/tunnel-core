@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -159,8 +160,13 @@ func (r *Router) buildRequestPayload(req *http.Request) []byte {
 	var buf bytes.Buffer
 	// Request line
 	buf.WriteString(fmt.Sprintf("%s %s %s\r\n", req.Method, req.URL.RequestURI(), req.Proto))
+	// Host header (stored separately in http.Request)
+	buf.WriteString(fmt.Sprintf("Host: %s\r\n", req.Host))
 	// Headers
 	for key, values := range req.Header {
+		if key == "Host" {
+			continue
+		}
 		for _, value := range values {
 			buf.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
 		}
@@ -175,20 +181,31 @@ func (r *Router) waitForResponse(
 	stream *connection.Stream,
 	w http.ResponseWriter,
 ) error {
-	// In a real implementation, we should parse the HTTP response headers
-	// from the agent here. For now, since the current protocol sends raw
-	// response data (assumed to be full HTTP response), we just copy.
+	// 1. Create a buffered reader to parse the response
+	reader := bufio.NewReader(stream)
 
-	// TODO: Parse actual HTTP Status and Headers from the stream.
-	// For now, we assume the agent sends a full HTTP response.
+	// 2. Parse HTTP response from stream
+	// Note: The agent sends a full HTTP response (Response line + Headers + Body)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		return fmt.Errorf("failed to read response from agent: %w", err)
+	}
+	defer resp.Body.Close()
 
-	// We use a small heuristic: If the first few bytes look like "HTTP/",
-	// we might need to parse it. But the current implementation just writes raw.
+	// 3. Copy headers from agent response to public response
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
 
-	// Stream from tunnel back to end-user
-	_, err := io.Copy(w, stream)
+	// 4. Set status code
+	w.WriteHeader(resp.StatusCode)
+
+	// 5. Stream response body back to the end-user
+	_, err = io.Copy(w, resp.Body)
 	if err != nil && err != io.EOF {
-		return fmt.Errorf("failed to stream response: %w", err)
+		return fmt.Errorf("failed to stream response body: %w", err)
 	}
 
 	return nil

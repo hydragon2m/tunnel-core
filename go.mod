@@ -4,4 +4,6 @@ go 1.22
 
 require github.com/hydragon2m/tunnel-protocol v0.1.1
 
+require github.com/golang-jwt/jwt/v5 v5.3.1
+
 replace github.com/hydragon2m/tunnel-protocol => ../tunnel-protocol

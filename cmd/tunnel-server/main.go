@@ -7,13 +7,16 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/hydragon2m/tunnel-core/connection"
+	"github.com/hydragon2m/tunnel-core/internal/dashboard"
 	"github.com/hydragon2m/tunnel-core/internal/handshake"
 	"github.com/hydragon2m/tunnel-core/internal/listener"
 	"github.com/hydragon2m/tunnel-core/internal/quota"
@@ -36,12 +39,16 @@ var (
 	publicKeyFile  = flag.String("public-key", "", "TLS key file for public connections")
 
 	// Base domain
-	baseDomain = flag.String("base-domain", "localhost", "Base domain for tunnels")
+	baseDomain    = flag.String("base-domain", "localhost", "Base domain for tunnels")
+	dashboardAddr = flag.String("dashboard-addr", ":9000", "Address to listen for dashboard")
 
 	// Config
 	maxConnections   = flag.Int("max-connections", 1000, "Maximum number of agent connections")
 	heartbeatTimeout = flag.Duration("heartbeat-timeout", 30*time.Second, "Heartbeat timeout")
 	authTimeout      = flag.Duration("auth-timeout", 10*time.Second, "Authentication timeout")
+
+	// Auth config
+	jwtSecret = flag.String("jwt-secret", "", "JWT secret key (if empty, uses simple token validation)")
 )
 
 func main() {
@@ -90,18 +97,23 @@ func main() {
 	reg := registry.NewRegistry(*baseDomain)
 	limiter := quota.NewLimiter(*maxConnections, 10000) // Max 10000 concurrent streams globally
 
-	// Simple token validator (replace with your auth logic)
-	validateToken := func(token string) (agentID string, err error) {
-		// TODO: Implement actual token validation
-		// For now, accept any non-empty token
-		if token == "" {
-			return "", handshake.ErrInvalidToken
+	var validator handshake.TokenValidator
+	if *jwtSecret != "" {
+		log.Println("Using JWT authentication")
+		validator = handshake.NewJWTValidator([]byte(*jwtSecret))
+	} else {
+		log.Println("Using simple token authentication (STUB)")
+		validator = &handshake.SimpleValidator{
+			ValidateFn: func(token string) (agentID string, err error) {
+				if token == "" {
+					return "", handshake.ErrInvalidToken
+				}
+				return token, nil
+			},
 		}
-		// Extract agent ID from token or use token as agent ID
-		return token, nil
 	}
 
-	authenticator := handshake.NewAuthenticator(validateToken, *authTimeout)
+	authenticator := handshake.NewAuthenticator(validator, *authTimeout)
 
 	// Setup connection callbacks
 	connManager.SetOnConnectionClosed(func(connID string) {
@@ -138,6 +150,15 @@ func main() {
 	go func() {
 		if err := publicListener.StartWithContext(ctx); err != nil {
 			log.Printf("Public listener error: %v", err)
+		}
+	}()
+
+	// Start dashboard
+	go func() {
+		db := dashboard.NewDashboard(connManager, reg)
+		log.Printf("Dashboard started on %s", *dashboardAddr)
+		if err := http.ListenAndServe(*dashboardAddr, db); err != nil && err != http.ErrServerClosed {
+			log.Printf("Dashboard error: %v", err)
 		}
 	}()
 
@@ -295,9 +316,46 @@ func handleAgentConnection(
 
 	log.Printf("Connection registered: %s (agent: %s)", connID, agentID)
 
+	// Register tunnels based on metadata
+	registeredTunnels := 0
+	if subdomains, ok := metadata["subdomains"]; ok && subdomains != "" {
+		for _, sub := range strings.Split(subdomains, ",") {
+			sub = strings.TrimSpace(sub)
+			if sub == "" {
+				continue
+			}
+			tunnel, err := reg.RegisterTunnel("", sub, connID, agentID, metadata)
+			if err != nil {
+				log.Printf("Failed to register tunnel for subdomain %s: %v", sub, err)
+			} else {
+				log.Printf("Tunnel registered: %s -> %s", tunnel.FullDomain, connID)
+				registeredTunnels++
+			}
+		}
+	} else if subdomain, ok := metadata["subdomain"]; ok && subdomain != "" {
+		tunnel, err := reg.RegisterTunnel("", subdomain, connID, agentID, metadata)
+		if err != nil {
+			log.Printf("Failed to register tunnel for subdomain %s: %v", subdomain, err)
+		} else {
+			log.Printf("Tunnel registered: %s -> %s", tunnel.FullDomain, connID)
+			registeredTunnels++
+		}
+	}
+
+	// Fallback to use agentID as subdomain
+	if agentID != "" {
+		tunnel, err := reg.RegisterTunnel("", agentID, connID, agentID, metadata)
+		if err != nil {
+			log.Printf("Failed to register fallback tunnel for agent %s: %v", agentID, err)
+		} else {
+			log.Printf("Fallback tunnel registered: %s -> %s", tunnel.FullDomain, connID)
+		}
+	}
+
 	// Wait for connection to close
 	<-registeredConn.Context().Done()
 	log.Printf("Connection closed: %s", connID)
+	// Tunnels are cleaned up by the OnConnectionClosed callback registered in main()
 }
 
 // netConnWrapper wraps net.Conn to implement connection.Conn interface

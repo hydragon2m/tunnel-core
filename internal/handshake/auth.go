@@ -2,15 +2,22 @@ package handshake
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
-	"github.com/hydragon2m/tunnel-protocol/go/v1"
+	"github.com/golang-jwt/jwt/v5"
+	v1 "github.com/hydragon2m/tunnel-protocol/go/v1"
 )
+
+// TokenValidator defined interface for token validation
+type TokenValidator interface {
+	ValidateToken(token string) (agentID string, accountID string, err error)
+}
 
 // Authenticator xử lý authentication handshake với agent
 type Authenticator struct {
 	// Token validator
-	validateToken func(token string) (agentID string, err error)
+	validator TokenValidator
 
 	// Config
 	authTimeout time.Duration
@@ -35,11 +42,55 @@ type AuthResponse struct {
 }
 
 // NewAuthenticator tạo Authenticator mới
-func NewAuthenticator(validateToken func(token string) (agentID string, err error), authTimeout time.Duration) *Authenticator {
+func NewAuthenticator(validator TokenValidator, authTimeout time.Duration) *Authenticator {
 	return &Authenticator{
-		validateToken: validateToken,
-		authTimeout:   authTimeout,
+		validator:   validator,
+		authTimeout: authTimeout,
 	}
+}
+
+// JWTValidator implements TokenValidator using JWT
+type JWTValidator struct {
+	secretKey []byte
+}
+
+func NewJWTValidator(secretKey []byte) *JWTValidator {
+	return &JWTValidator{secretKey: secretKey}
+}
+
+type Claims struct {
+	AgentID   string `json:"agent_id"`
+	AccountID string `json:"account_id"`
+	jwt.RegisteredClaims
+}
+
+func (v *JWTValidator) ValidateToken(tokenString string) (string, string, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return v.secretKey, nil
+	})
+
+	if err != nil {
+		return "", "", err
+	}
+
+	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
+		return claims.AgentID, claims.AccountID, nil
+	}
+
+	return "", "", ErrInvalidToken
+}
+
+// SimpleValidator implements TokenValidator for testing
+type SimpleValidator struct {
+	ValidateFn func(token string) (string, error)
+}
+
+func (v *SimpleValidator) ValidateToken(token string) (string, string, error) {
+	agentID, err := v.ValidateFn(token)
+	return agentID, "legacy-account", err
 }
 
 // HandleAuth xử lý FrameAuth từ agent
@@ -62,11 +113,11 @@ func (a *Authenticator) HandleAuth(frame *v1.Frame) (agentID string, metadata ma
 	}
 
 	// Validate token
-	if a.validateToken == nil {
+	if a.validator == nil {
 		return "", nil, ErrNoTokenValidator
 	}
 
-	validatedAgentID, err := a.validateToken(req.Token)
+	validatedAgentID, accountID, err := a.validator.ValidateToken(req.Token)
 	if err != nil {
 		return "", nil, err
 	}
@@ -76,6 +127,7 @@ func (a *Authenticator) HandleAuth(frame *v1.Frame) (agentID string, metadata ma
 
 	// Build metadata
 	metadata = make(map[string]string)
+	metadata["account_id"] = accountID
 	if req.AgentID != "" {
 		metadata["client_agent_id"] = req.AgentID
 	}

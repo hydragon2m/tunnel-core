@@ -420,9 +420,16 @@ func (m *Manager) handleStreamFrame(c *Connection, frame *v1.Frame) error {
 		if !exists {
 			return ErrStreamNotFound
 		}
-		// Forward data to stream
+		// Forward data to stream (Non-blocking to avoid HOL blocking)
+		// We use a small timeout to ensure we don't block the entire connection
+		// if one stream is slow, but also don't immediately drop packets.
 		select {
 		case stream.dataIn <- frame.Payload:
+		case <-time.After(100 * time.Millisecond):
+			// If stream channel is full for too long, we might need to drop or close
+			// For now, log and continue to avoid blocking others.
+			// Ideally, we'd implement flow control.
+			fmt.Printf("Warning: stream %d data channel full, dropping frame to avoid HOL blocking\n", frame.StreamID)
 		case <-stream.closeCh:
 			return ErrStreamClosed
 		case <-c.ctx.Done():
@@ -497,6 +504,18 @@ func (c *Connection) GetStream(streamID uint32) (*Stream, bool) {
 	return stream, ok
 }
 
+// GetAllStreams returns all active streams on this connection
+func (c *Connection) GetAllStreams() []*Stream {
+	c.streamsMu.RLock()
+	defer c.streamsMu.RUnlock()
+
+	streams := make([]*Stream, 0, len(c.streams))
+	for _, s := range c.streams {
+		streams = append(streams, s)
+	}
+	return streams
+}
+
 // AllocateStreamID cấp phát stream ID mới
 func (c *Connection) AllocateStreamID() uint32 {
 	c.streamsMu.Lock()
@@ -514,6 +533,9 @@ func (c *Connection) SendFrame(frame *v1.Frame) error {
 	if c.state != StateConnected && c.state != StateAuthenticated {
 		c.stateMu.RUnlock()
 		return ErrConnectionClosed
+	}
+	if frame.Type == v1.FrameOpenStream {
+		c.createStream(frame.StreamID)
 	}
 	c.stateMu.RUnlock()
 
@@ -573,7 +595,7 @@ func (s *Stream) DataIn() chan<- []byte {
 
 // Read implements io.Reader
 func (s *Stream) Read(p []byte) (n int, err error) {
-	if s.readBuf != nil && len(s.readBuf) > 0 {
+	if len(s.readBuf) > 0 {
 		n = copy(p, s.readBuf)
 		s.readBuf = s.readBuf[n:]
 		return n, nil
