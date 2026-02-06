@@ -6,12 +6,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/hydragon2m/tunnel-core/connection"
 	"github.com/hydragon2m/tunnel-core/internal/quota"
 	"github.com/hydragon2m/tunnel-core/internal/registry"
+	"github.com/hydragon2m/tunnel-core/pkg/metrics"
+	"github.com/hydragon2m/tunnel-core/pkg/trace"
 	v1 "github.com/hydragon2m/tunnel-protocol/go/v1"
 )
 
@@ -41,8 +45,39 @@ func (r *Router) SetOnRequest(callback func(accountID string, duration time.Dura
 
 // ServeHTTP implements http.Handler
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Extract or generate request ID
+	requestID := trace.ExtractRequestID(req)
+	if requestID == "" {
+		requestID = trace.NewRequestID()
+	}
+
+	// Add request ID to context
+	ctx := trace.WithRequestID(req.Context(), requestID)
+	req = req.WithContext(ctx)
+
+	// Add request ID to response headers
+	trace.InjectRequestIDToResponse(w, requestID)
+
+	// Track request metrics
+	start := time.Now()
+	var statusCode int
+	var accountID string
+	defer func() {
+		duration := time.Since(start)
+		log.Printf("[%s] Request completed: %s %s - status=%d duration=%v",
+			requestID, req.Method, req.URL.Path, statusCode, duration)
+
+		if accountID != "" {
+			metrics.Get().RecordRequest(accountID, req.Method, strconv.Itoa(statusCode), duration)
+		}
+		if r.onRequest != nil {
+			r.onRequest(accountID, duration, statusCode >= 200 && statusCode < 300)
+		}
+	}()
+
 	// Health check endpoint
 	if req.URL.Path == "/health" {
+		statusCode = http.StatusOK
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 		return
@@ -51,20 +86,33 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Extract domain from Host header
 	host := req.Host
 	if host == "" {
+		log.Printf("[%s] Error: Missing Host header", requestID)
+		statusCode = http.StatusBadRequest
+		metrics.Get().RecordError("missing_host", "router")
 		http.Error(w, "Missing Host header", http.StatusBadRequest)
 		return
 	}
 
 	// Lookup tunnel
+	log.Printf("[%s] Looking up tunnel for domain: %s", requestID, host)
 	tunnel, ok := r.registry.GetTunnel(host)
 	if !ok {
+		log.Printf("[%s] Error: Tunnel not found for domain: %s", requestID, host)
+		statusCode = http.StatusNotFound
+		metrics.Get().RecordError("tunnel_not_found", "router")
 		http.Error(w, fmt.Sprintf("Tunnel not found for domain: %s", host), http.StatusNotFound)
 		return
 	}
 
+	// Set account ID for metrics (use AgentID as account identifier)
+	accountID = tunnel.AgentID
+	log.Printf("[%s] Routing to agent: %s (connection: %s)", requestID, accountID, tunnel.ConnectionID)
+
 	// Check quota/rate limits
 	if r.limiter != nil {
 		if err := r.limiter.CheckRequest(tunnel.AgentID, host); err != nil {
+			statusCode = http.StatusTooManyRequests
+			metrics.Get().RecordError("quota_exceeded", "router")
 			http.Error(w, fmt.Sprintf("Rate limit exceeded: %v", err), http.StatusTooManyRequests)
 			return
 		}
@@ -73,6 +121,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Get connection
 	conn, ok := r.connManager.GetConnection(tunnel.ConnectionID)
 	if !ok {
+		statusCode = http.StatusServiceUnavailable
+		metrics.Get().RecordError("connection_not_found", "router")
 		http.Error(w, "Connection not found", http.StatusServiceUnavailable)
 		return
 	}
@@ -95,8 +145,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer cancel()
 
 	// Handle request
-	start := time.Now()
-	err := r.handleRequest(ctx, conn, streamID, w, req)
+	var err error
+	err = r.handleRequest(ctx, conn, streamID, w, req)
 	duration := time.Since(start)
 
 	success := (err == nil)

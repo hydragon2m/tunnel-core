@@ -22,7 +22,10 @@ import (
 	"github.com/hydragon2m/tunnel-core/internal/quota"
 	"github.com/hydragon2m/tunnel-core/internal/registry"
 	"github.com/hydragon2m/tunnel-core/internal/router"
+	"github.com/hydragon2m/tunnel-core/pkg/health"
+	"github.com/hydragon2m/tunnel-core/pkg/metrics"
 	v1 "github.com/hydragon2m/tunnel-protocol/go/v1"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -41,6 +44,7 @@ var (
 	// Base domain
 	baseDomain    = flag.String("base-domain", "localhost", "Base domain for tunnels")
 	dashboardAddr = flag.String("dashboard-addr", ":9000", "Address to listen for dashboard")
+	metricsAddr   = flag.String("metrics-addr", ":9090", "Address to listen for Prometheus metrics")
 
 	// Config
 	maxConnections   = flag.Int("max-connections", 1000, "Maximum number of agent connections")
@@ -88,6 +92,13 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting Tunnel Core Server...")
 
+	// Initialize Prometheus metrics
+	metrics.Init()
+	log.Println("Prometheus metrics initialized")
+
+	// Initialize health checker
+	healthChecker := health.NewChecker("1.0.0")
+
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -134,6 +145,38 @@ func main() {
 	// Create router with limiter
 	httpRouter := router.NewRouter(reg, connManager, limiter, 30*time.Second)
 
+	// Register health checks
+	healthChecker.RegisterCheck("connections", func() health.Check {
+		// Get all connections and count active ones
+		conns := connManager.GetAllConnections()
+		activeCount := len(conns)
+		maxConn := *maxConnections
+
+		status := health.StatusHealthy
+		message := fmt.Sprintf("%d/%d connections", activeCount, maxConn)
+
+		if activeCount >= maxConn {
+			status = health.StatusUnhealthy
+			message = "Connection limit reached"
+		} else if float64(activeCount)/float64(maxConn) > 0.9 {
+			status = health.StatusDegraded
+			message = "Connection limit nearly reached"
+		}
+
+		return health.Check{
+			Status:  status,
+			Message: message,
+			Details: map[string]interface{}{
+				"active": activeCount,
+				"max":    maxConn,
+			},
+		}
+	}, true)
+
+	healthChecker.RegisterCheck("system", func() health.Check {
+		return health.SystemCheck()
+	}, false)
+
 	// Start public listener
 	publicListener, err := listener.NewHTTPListener(*publicAddr, *publicTLS, *publicCertFile, *publicKeyFile, httpRouter)
 	if err != nil {
@@ -162,6 +205,43 @@ func main() {
 		}
 	}()
 
+	// Start metrics server
+	metricsServer := &http.Server{
+		Addr:    *metricsAddr,
+		Handler: promhttp.Handler(),
+	}
+	go func() {
+		log.Printf("Metrics server started on %s", *metricsAddr)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Metrics server error: %v", err)
+		}
+	}()
+
+	// Start health check server (on dashboard port with /health endpoints)
+	healthMux := http.NewServeMux()
+	healthMux.HandleFunc("/health", healthChecker.SimpleHandler())
+	healthMux.HandleFunc("/health/live", healthChecker.LivenessHandler())
+	healthMux.HandleFunc("/health/ready", healthChecker.ReadinessHandler())
+	healthMux.HandleFunc("/health/detailed", healthChecker.DetailedHandler())
+
+	// Combine dashboard and health endpoints
+	db := dashboard.NewDashboard(connManager, reg)
+	combinedMux := http.NewServeMux()
+	combinedMux.Handle("/health", healthMux)
+	combinedMux.Handle("/health/", healthMux)
+	combinedMux.Handle("/", db)
+
+	dashboardServer := &http.Server{
+		Addr:    *dashboardAddr,
+		Handler: combinedMux,
+	}
+	go func() {
+		log.Printf("Dashboard and health checks started on %s", *dashboardAddr)
+		if err := dashboardServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Dashboard server error: %v", err)
+		}
+	}()
+
 	// Wait for interrupt signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -179,6 +259,11 @@ func main() {
 	// Close listeners
 	agentListener.Close()
 	publicListener.Close()
+
+	// Shutdown metrics server
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Metrics server shutdown error: %v", err)
+	}
 
 	// Close all connections
 	// TODO: Implement graceful connection close
