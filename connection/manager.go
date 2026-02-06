@@ -321,9 +321,11 @@ func (m *Manager) handleConnection(c *Connection) {
 					Version:  v1.Version,
 					Type:     v1.FrameHeartbeat,
 					Flags:    v1.FlagAck,
-					StreamID: 0,
+					StreamID: v1.StreamIDControl,
 				}
-				_ = v1.Encode(c.Conn, ack)
+				if err := v1.Encode(c.Conn, ack); err != nil {
+					fmt.Printf("Warning: failed to send heartbeat ACK: %v\n", err)
+				}
 				v1.PutBuffer(buf)
 				continue
 			}
@@ -659,8 +661,7 @@ func (s *Stream) Close() error {
 		StreamID: s.ID,
 		Payload:  nil,
 	}
-	_ = s.conn.SendFrame(frame)
-	return nil
+	return s.conn.SendFrame(frame)
 }
 
 // CloseCh returns the close channel

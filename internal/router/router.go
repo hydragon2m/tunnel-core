@@ -145,8 +145,13 @@ func (r *Router) handleRequest(
 	if req.Body != nil {
 		go func() {
 			// io.Copy will call Stream.Write which sends FrameData
-			_, _ = io.Copy(stream, req.Body)
-			_ = req.Body.Close()
+			if _, copyErr := io.Copy(stream, req.Body); copyErr != nil {
+				// Log error but don't fail the request - response might still be valid
+				fmt.Printf("Warning: failed to copy request body: %v\n", copyErr)
+			}
+			if closeErr := req.Body.Close(); closeErr != nil {
+				fmt.Printf("Warning: failed to close request body: %v\n", closeErr)
+			}
 			// EndStream flag is sent by stream.Close() via defer above
 		}()
 	}
