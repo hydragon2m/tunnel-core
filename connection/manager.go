@@ -266,6 +266,60 @@ func (m *Manager) CloseConnection(connID string) error {
 	return nil
 }
 
+// GracefulShutdown gracefully closes all connections with timeout
+// Returns the number of connections that were forcefully closed due to timeout
+func (m *Manager) GracefulShutdown(ctx context.Context) int {
+	// Get all connections
+	m.connsMu.RLock()
+	connIDs := make([]string, 0, len(m.connections))
+	for connID := range m.connections {
+		connIDs = append(connIDs, connID)
+	}
+	m.connsMu.RUnlock()
+
+	if len(connIDs) == 0 {
+		return 0
+	}
+
+	// Create done channel for each connection
+	doneCh := make(chan string, len(connIDs))
+
+	// Close each connection gracefully
+	for _, connID := range connIDs {
+		go func(id string) {
+			m.CloseConnection(id)
+			doneCh <- id
+		}(connID)
+	}
+
+	// Wait for all connections to close or timeout
+	closed := 0
+	timeout := time.NewTimer(0)
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.NewTimer(time.Until(deadline))
+	} else {
+		timeout = time.NewTimer(10 * time.Second) // Default 10s timeout
+	}
+	defer timeout.Stop()
+
+	for closed < len(connIDs) {
+		select {
+		case <-doneCh:
+			closed++
+		case <-timeout.C:
+			// Timeout - force close remaining connections
+			remaining := len(connIDs) - closed
+			return remaining
+		case <-ctx.Done():
+			// Context cancelled - force close remaining
+			remaining := len(connIDs) - closed
+			return remaining
+		}
+	}
+
+	return 0 // All connections closed gracefully
+}
+
 // handleConnection xử lý frames từ connection
 func (m *Manager) handleConnection(c *Connection) {
 	// Ensure connection is cleaned up when this function exits
@@ -518,7 +572,7 @@ func (c *Connection) GetAllStreams() []*Stream {
 	return streams
 }
 
-// AllocateStreamID cấp phát stream ID mới
+// AllocateStreamID cấp phát ID mới cho stream
 func (c *Connection) AllocateStreamID() uint32 {
 	c.streamsMu.Lock()
 	defer c.streamsMu.Unlock()

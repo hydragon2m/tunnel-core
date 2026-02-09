@@ -1,287 +1,248 @@
 package dashboard
 
 import (
+	"encoding/json"
+	"fmt"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/hydragon2m/tunnel-core/connection"
+	"github.com/hydragon2m/tunnel-core/internal/account"
 	"github.com/hydragon2m/tunnel-core/internal/registry"
 )
 
-// Dashboard handles the monitoring UI
 type Dashboard struct {
-	connManager *connection.Manager
-	registry    *registry.Registry
-	startTime   time.Time
+	connManager  *connection.Manager
+	registry     *registry.Registry
+	accountStore account.Store
+	startTime    time.Time
 }
 
-// NewDashboard creates a new dashboard handler
-func NewDashboard(cm *connection.Manager, reg *registry.Registry) *Dashboard {
+func NewDashboard(connManager *connection.Manager, reg *registry.Registry, store account.Store) *Dashboard {
 	return &Dashboard{
-		connManager: cm,
-		registry:    reg,
-		startTime:   time.Now(),
+		connManager:  connManager,
+		registry:     reg,
+		accountStore: store,
+		startTime:    time.Now(),
 	}
 }
 
-// ServeHTTP implements http.Handler
 func (d *Dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+	// Simple CORS
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Tunnel-Token")
+
+	if r.Method == http.MethodOptions {
 		return
 	}
 
-	conns := d.connManager.GetAllConnections()
-	tunnels := d.registry.ListTunnels()
-
-	data := struct {
-		StartTime   string
-		Uptime      string
-		Connections int
-		Streams     int
-		Tunnels     int
-		ConnList    []*connection.Connection
-		TunnelList  []*registry.Tunnel
-	}{
-		StartTime:   d.startTime.Format(time.RFC3339),
-		Uptime:      time.Since(d.startTime).Round(time.Second).String(),
-		Connections: len(conns),
-		Tunnels:     len(tunnels),
-		ConnList:    conns,
-		TunnelList:  tunnels,
+	if strings.HasPrefix(r.URL.Path, "/api") {
+		d.handleAPI(w, r)
+		return
 	}
 
-	// Calculate total streams
-	for _, c := range conns {
-		data.Streams += len(c.GetAllStreams())
-	}
-
-	tmpl := template.Must(template.New("dashboard").Parse(dashboardHTML))
-	tmpl.Execute(w, data)
+	d.handleView(w, r)
 }
 
-// Helper to get all streams from a connection (I'll need to add this to Connection struct)
-// Actually, I can just use a helper function here for now or add it to Connection.
+func (d *Dashboard) handleView(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/admin" {
+		conns := d.connManager.GetAllConnections()
+		tunnels := d.registry.ListTunnels()
 
-const dashboardHTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Go-Tunnel Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-color: #0f172a;
-            --card-bg: rgba(30, 41, 59, 0.7);
-            --accent-color: #38bdf8;
-            --text-primary: #f1f5f9;
-            --text-secondary: #94a3b8;
-            --border-color: rgba(255, 255, 255, 0.1);
-            --success-color: #10b981;
-        }
+		data := struct {
+			Uptime      string
+			Connections int
+			Streams     int
+			Tunnels     int
+			ConnList    []*connection.Connection
+			TunnelList  []*registry.Tunnel
+		}{
+			Uptime:      time.Since(d.startTime).Round(time.Second).String(),
+			Connections: len(conns),
+			Streams:     d.getTotalStreams(),
+			Tunnels:     len(tunnels),
+			ConnList:    conns,
+			TunnelList:  tunnels,
+		}
 
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-primary);
-            margin: 0;
-            padding: 20px;
-            line-height: 1.5;
-        }
+		tmpl, _ := template.New("admin").Parse(adminHTML)
+		tmpl.Execute(w, data)
+		return
+	}
 
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
+	// Default to User Portal
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(userHTML))
+}
 
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 40px;
-            padding-bottom: 20px;
-            border-bottom: 1px solid var(--border-color);
-        }
+func (d *Dashboard) getTotalStreams() int {
+	conns := d.connManager.GetAllConnections()
+	count := 0
+	for _, c := range conns {
+		count += len(c.GetAllStreams())
+	}
+	return count
+}
 
-        h1 {
-            margin: 0;
-            font-size: 1.5rem;
-            font-weight: 700;
-            background: linear-gradient(to right, #38bdf8, #818cf8);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
+func (d *Dashboard) handleAPI(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api")
 
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 40px;
-        }
+	// --- AUTH ENDPOINTS ---
 
-        .stat-card {
-            background: var(--card-bg);
-            backdrop-filter: blur(10px);
-            padding: 24px;
-            border-radius: 16px;
-            border: 1px solid var(--border-color);
-            transition: transform 0.2s;
-        }
+	if path == "/auth/register" && r.Method == http.MethodPost {
+		var req struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
 
-        .stat-card:hover {
-            transform: translateY(-4px);
-        }
+		if req.Username == "" || req.Password == "" {
+			http.Error(w, "Username and password required", http.StatusBadRequest)
+			return
+		}
 
-        .stat-label {
-            display: block;
-            color: var(--text-secondary);
-            font-size: 0.875rem;
-            margin-bottom: 8px;
-        }
+		if _, err := d.accountStore.GetByUsername(req.Username); err == nil {
+			http.Error(w, "Username already exists", http.StatusConflict)
+			return
+		}
 
-        .stat-value {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--accent-color);
-        }
+		acc := &account.Account{
+			ID:         fmt.Sprintf("user-%d", time.Now().Unix()),
+			Username:   req.Username,
+			Token:      fmt.Sprintf("tok-%d", time.Now().UnixNano()),
+			AdminToken: fmt.Sprintf("adm-%d", time.Now().UnixNano()),
+			MaxConns:   5,
+		}
+		acc.SetPassword(req.Password)
 
-        .section-title {
-            font-size: 1.25rem;
-            margin-bottom: 20px;
-            color: var(--text-primary);
-        }
+		if err := d.accountStore.Save(acc); err != nil {
+			http.Error(w, "Failed to save account", http.StatusInternalServerError)
+			return
+		}
 
-        .table-container {
-            background: var(--card-bg);
-            border-radius: 16px;
-            border: 1px solid var(--border-color);
-            overflow: hidden;
-            margin-bottom: 40px;
-        }
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"id": acc.ID, "token": acc.AdminToken})
+		return
+	}
 
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            text-align: left;
-        }
+	if path == "/auth/login" && r.Method == http.MethodPost {
+		var req struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
 
-        th {
-            padding: 16px;
-            background: rgba(255, 255, 255, 0.05);
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text-secondary);
-        }
+		acc, err := d.accountStore.GetByUsername(req.Username)
+		if err != nil || !acc.CheckPassword(req.Password) {
+			http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+			return
+		}
 
-        td {
-            padding: 16px;
-            border-bottom: 1px solid var(--border-color);
-            font-size: 0.875rem;
-        }
+		json.NewEncoder(w).Encode(map[string]string{
+			"id":          acc.ID,
+			"token":       acc.AdminToken,
+			"agent_token": acc.Token,
+		})
+		return
+	}
 
-        tr:last-child td {
-            border-bottom: none;
-        }
+	// --- PROTECTED ENDPOINTS ---
+	token := r.Header.Get("X-Tunnel-Token")
+	var currentAcc *account.Account
+	if token != "" {
+		accs, _ := d.accountStore.List()
+		for _, a := range accs {
+			if a.AdminToken == token {
+				currentAcc = a
+				break
+			}
+		}
+		if currentAcc == nil {
+			currentAcc, _ = d.accountStore.GetByToken(token)
+		}
+	}
 
-        .mono {
-            font-family: 'JetBrains Mono', monospace;
-        }
+	if currentAcc == nil && !strings.HasPrefix(path, "/auth/") {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
-        .badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 9999px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            background: rgba(16, 185, 129, 0.1);
-            color: var(--success-color);
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>Go-Tunnel Dashboard</h1>
-            <div style="font-size: 0.875rem; color: var(--text-secondary)">
-                Uptime: <span class="mono">{{.Uptime}}</span>
-            </div>
-        </header>
+	if path == "/user/status" && r.Method == http.MethodGet {
+		conns := d.connManager.GetAllConnections()
+		var myConn *connection.Connection
+		for _, c := range conns {
+			if c.AgentID == currentAcc.ID {
+				myConn = c
+				break
+			}
+		}
 
-        <div class="stats-grid">
-            <div class="stat-card">
-                <span class="stat-label">Active Connections</span>
-                <span class="stat-value">{{.Connections}}</span>
-            </div>
-            <div class="stat-card">
-                <span class="stat-label">Active Streams</span>
-                <span class="stat-value">{{.Streams}}</span>
-            </div>
-            <div class="stat-card">
-                <span class="stat-label">Registered Tunnels</span>
-                <span class="stat-value">{{.Tunnels}}</span>
-            </div>
-        </div>
+		status := "offline"
+		if myConn != nil {
+			status = "online"
+		}
 
-        <h2 class="section-title">Active Connections</h2>
-        <div class="table-container">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Connection ID</th>
-                        <th>Agent ID</th>
-                        <th>Account ID</th>
-                        <th>Connected At</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {{range .ConnList}}
-                    <tr>
-                        <td class="mono">{{.ID}}</td>
-                        <td>{{.AgentID}}</td>
-                        <td>{{.AccountID}}</td>
-                        <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
-                    </tr>
-                    {{else}}
-                    <tr>
-                        <td colspan="4" style="text-align: center; color: var(--text-secondary)">No active connections</td>
-                    </tr>
-                    {{end}}
-                </tbody>
-            </table>
-        </div>
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":     status,
+			"account_id": currentAcc.ID,
+			"username":   currentAcc.Username,
+		})
+		return
+	}
 
-        <h2 class="section-title">Registered Tunnels</h2>
-        <div class="table-container">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Domain</th>
-                        <th>Connection ID</th>
-                        <th>Created At</th>
-                        <th>Last Access</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {{range .TunnelList}}
-                    <tr>
-                        <td class="mono" style="color: var(--accent-color)">{{.FullDomain}}</td>
-                        <td class="mono">{{.ConnectionID}}</td>
-                        <td>{{.CreatedAt.Format "15:04:05"}}</td>
-                        <td>{{if not .LastAccess.IsZero}}{{.LastAccess.Format "15:04:05"}}{{else}}Never{{end}}</td>
-                    </tr>
-                    {{else}}
-                    <tr>
-                        <td colspan="4" style="text-align: center; color: var(--text-secondary)">No registered tunnels</td>
-                    </tr>
-                    {{end}}
-                </tbody>
-            </table>
-        </div>
-    </div>
-</body>
-</html>
-`
+	if path == "/user/config" && r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"account_id":  currentAcc.ID,
+			"subdomains":  currentAcc.Subdomains,
+			"max_conns":   currentAcc.MaxConns,
+			"mappings":    currentAcc.Mappings,
+			"agent_token": currentAcc.Token,
+		})
+		return
+	}
+
+	if path == "/user/mappings" && r.Method == http.MethodPost {
+		var req []account.Mapping
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		currentAcc.Mappings = req
+		if err := d.accountStore.Save(currentAcc); err != nil {
+			http.Error(w, "Failed to save mappings", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if strings.HasPrefix(path, "/connections/") && r.Method == http.MethodDelete {
+		if currentAcc == nil || currentAcc.ID != "default" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		connID := strings.TrimPrefix(path, "/connections/")
+		if err := d.connManager.CloseConnection(connID); err == nil {
+			w.WriteHeader(http.StatusNoContent)
+		} else {
+			http.Error(w, "Connection not found", http.StatusNotFound)
+		}
+		return
+	}
+
+	http.NotFound(w, r)
+}

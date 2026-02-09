@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hydragon2m/tunnel-core/connection"
+	"github.com/hydragon2m/tunnel-core/internal/account"
 	"github.com/hydragon2m/tunnel-core/internal/dashboard"
 	"github.com/hydragon2m/tunnel-core/internal/handshake"
 	"github.com/hydragon2m/tunnel-core/internal/listener"
@@ -104,6 +105,23 @@ func main() {
 	defer cancel()
 
 	// Initialize components
+	accountStore, err := account.NewJSONStore("accounts.json")
+	if err != nil {
+		log.Fatalf("Failed to initialize account store: %v", err)
+	}
+
+	// Create default account if none exists
+	if accs, _ := accountStore.List(); len(accs) == 0 {
+		log.Println("Creating default account...")
+		accountStore.Save(&account.Account{
+			ID:         "default",
+			Token:      "test-token",
+			AdminToken: "admin-token",
+			Subdomains: []string{"test", "demo"},
+			MaxConns:   10,
+		})
+	}
+
 	connManager := connection.NewManager(*maxConnections, *maxConnections, *heartbeatTimeout)
 	reg := registry.NewRegistry(*baseDomain)
 	limiter := quota.NewLimiter(*maxConnections, 10000) // Max 10000 concurrent streams globally
@@ -113,13 +131,14 @@ func main() {
 		log.Println("Using JWT authentication")
 		validator = handshake.NewJWTValidator([]byte(*jwtSecret))
 	} else {
-		log.Println("Using simple token authentication (STUB)")
+		log.Println("Using account-based token authentication")
 		validator = &handshake.SimpleValidator{
 			ValidateFn: func(token string) (agentID string, err error) {
-				if token == "" {
+				acc, err := accountStore.GetByToken(token)
+				if err != nil {
 					return "", handshake.ErrInvalidToken
 				}
-				return token, nil
+				return acc.ID, nil
 			},
 		}
 	}
@@ -196,27 +215,6 @@ func main() {
 		}
 	}()
 
-	// Start dashboard
-	go func() {
-		db := dashboard.NewDashboard(connManager, reg)
-		log.Printf("Dashboard started on %s", *dashboardAddr)
-		if err := http.ListenAndServe(*dashboardAddr, db); err != nil && err != http.ErrServerClosed {
-			log.Printf("Dashboard error: %v", err)
-		}
-	}()
-
-	// Start metrics server
-	metricsServer := &http.Server{
-		Addr:    *metricsAddr,
-		Handler: promhttp.Handler(),
-	}
-	go func() {
-		log.Printf("Metrics server started on %s", *metricsAddr)
-		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Metrics server error: %v", err)
-		}
-	}()
-
 	// Start health check server (on dashboard port with /health endpoints)
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/health", healthChecker.SimpleHandler())
@@ -224,11 +222,12 @@ func main() {
 	healthMux.HandleFunc("/health/ready", healthChecker.ReadinessHandler())
 	healthMux.HandleFunc("/health/detailed", healthChecker.DetailedHandler())
 
-	// Combine dashboard and health endpoints
-	db := dashboard.NewDashboard(connManager, reg)
+	// Combine dashboard, health and metrics endpoints
+	db := dashboard.NewDashboard(connManager, reg, accountStore)
 	combinedMux := http.NewServeMux()
 	combinedMux.Handle("/health", healthMux)
 	combinedMux.Handle("/health/", healthMux)
+	combinedMux.Handle("/metrics", promhttp.Handler())
 	combinedMux.Handle("/", db)
 
 	dashboardServer := &http.Server{
@@ -236,7 +235,7 @@ func main() {
 		Handler: combinedMux,
 	}
 	go func() {
-		log.Printf("Dashboard and health checks started on %s", *dashboardAddr)
+		log.Printf("Dashboard, health checks, and metrics started on %s", *dashboardAddr)
 		if err := dashboardServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Dashboard server error: %v", err)
 		}
@@ -260,18 +259,24 @@ func main() {
 	agentListener.Close()
 	publicListener.Close()
 
-	// Shutdown metrics server
-	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Metrics server shutdown error: %v", err)
+	// Shutdown dashboard server
+	if err := dashboardServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Dashboard server shutdown error: %v", err)
 	}
 
-	// Close all connections
-	// TODO: Implement graceful connection close
+	// Gracefully close all connections
+	log.Println("Closing agent connections...")
+	timedOut := connManager.GracefulShutdown(shutdownCtx)
+	if timedOut > 0 {
+		log.Printf("Warning: %d connections were forcefully closed due to timeout", timedOut)
+	} else {
+		log.Println("All connections closed gracefully")
+	}
 
 	select {
 	case <-shutdownCtx.Done():
 		log.Println("Shutdown timeout")
-	case <-time.After(1 * time.Second):
+	case <-time.After(100 * time.Millisecond):
 		log.Println("Shutdown complete")
 	}
 }
