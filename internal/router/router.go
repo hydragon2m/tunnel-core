@@ -70,9 +70,6 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if accountID != "" {
 			metrics.Get().RecordRequest(accountID, req.Method, strconv.Itoa(statusCode), duration)
 		}
-		if r.onRequest != nil {
-			r.onRequest(accountID, duration, statusCode >= 200 && statusCode < 300)
-		}
 	}()
 
 	// Health check endpoint

@@ -266,6 +266,26 @@ func (m *Manager) CloseConnection(connID string) error {
 	return nil
 }
 
+// DisconnectAccount closes all connections belonging to a specific account
+func (m *Manager) DisconnectAccount(accountID string) int {
+	m.connsMu.RLock()
+	var toClose []string
+	for connID, conn := range m.connections {
+		if conn.AccountID == accountID {
+			toClose = append(toClose, connID)
+		}
+	}
+	m.connsMu.RUnlock()
+
+	closedCount := 0
+	for _, connID := range toClose {
+		if err := m.CloseConnection(connID); err == nil {
+			closedCount++
+		}
+	}
+	return closedCount
+}
+
 // GracefulShutdown gracefully closes all connections with timeout
 // Returns the number of connections that were forcefully closed due to timeout
 func (m *Manager) GracefulShutdown(ctx context.Context) int {

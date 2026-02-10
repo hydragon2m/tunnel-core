@@ -1,8 +1,10 @@
 package handshake
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -85,12 +87,56 @@ func (v *JWTValidator) ValidateToken(tokenString string) (string, string, error)
 
 // SimpleValidator implements TokenValidator for testing
 type SimpleValidator struct {
-	ValidateFn func(token string) (string, error)
+	ValidateFn func(token string) (string, string, error)
 }
 
 func (v *SimpleValidator) ValidateToken(token string) (string, string, error) {
-	agentID, err := v.ValidateFn(token)
-	return agentID, "legacy-account", err
+	return v.ValidateFn(token)
+}
+
+// RemoteValidator implements TokenValidator by calling an external API
+type RemoteValidator struct {
+	apiURL string
+}
+
+func NewRemoteValidator(apiURL string) *RemoteValidator {
+	return &RemoteValidator{apiURL: apiURL}
+}
+
+func (v *RemoteValidator) ValidateToken(token string) (string, string, error) {
+	reqBody, _ := json.Marshal(map[string]string{"token": token})
+	resp, err := http.Post(v.apiURL, "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", "", fmt.Errorf("remote validation failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return "", "", ErrInvalidToken
+		}
+		return "", "", fmt.Errorf("remote validation error: %s", resp.Status)
+	}
+
+	var result struct {
+		Success bool `json:"success"`
+		Data    struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+		Error string `json:"error"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", fmt.Errorf("failed to decode validation response: %w", err)
+	}
+
+	if !result.Success {
+		return "", "", fmt.Errorf("remote validation error: %s", result.Error)
+	}
+
+	// For now, use UserID as both AgentID and AccountID to preserve mapping
+	// UserID is what the stats reporting uses
+	return result.Data.UserID, result.Data.UserID, nil
 }
 
 // HandleAuth xử lý FrameAuth từ agent

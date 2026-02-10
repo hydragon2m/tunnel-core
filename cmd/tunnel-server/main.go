@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -23,6 +24,7 @@ import (
 	"github.com/hydragon2m/tunnel-core/internal/quota"
 	"github.com/hydragon2m/tunnel-core/internal/registry"
 	"github.com/hydragon2m/tunnel-core/internal/router"
+	"github.com/hydragon2m/tunnel-core/internal/stats"
 	"github.com/hydragon2m/tunnel-core/pkg/health"
 	"github.com/hydragon2m/tunnel-core/pkg/metrics"
 	v1 "github.com/hydragon2m/tunnel-protocol/go/v1"
@@ -131,16 +133,12 @@ func main() {
 		log.Println("Using JWT authentication")
 		validator = handshake.NewJWTValidator([]byte(*jwtSecret))
 	} else {
-		log.Println("Using account-based token authentication")
-		validator = &handshake.SimpleValidator{
-			ValidateFn: func(token string) (agentID string, err error) {
-				acc, err := accountStore.GetByToken(token)
-				if err != nil {
-					return "", handshake.ErrInvalidToken
-				}
-				return acc.ID, nil
-			},
+		adminValidateURL := os.Getenv("ADMIN_API_VALIDATE_URL")
+		if adminValidateURL == "" {
+			adminValidateURL = "http://tunnel-admin-api:3000/api/internal/validate-token"
 		}
+		log.Printf("Using remote token authentication via %s", adminValidateURL)
+		validator = handshake.NewRemoteValidator(adminValidateURL)
 	}
 
 	authenticator := handshake.NewAuthenticator(validator, *authTimeout)
@@ -163,6 +161,18 @@ func main() {
 
 	// Create router with limiter
 	httpRouter := router.NewRouter(reg, connManager, limiter, 30*time.Second)
+
+	// Initialize stats collector
+	adminURL := os.Getenv("ADMIN_API_URL")
+	if adminURL == "" {
+		adminURL = "http://admin-api:3000/api/internal/usage"
+	}
+	collector := stats.NewCollector(adminURL, 10*time.Second)
+	httpRouter.SetOnRequest(func(accountID string, duration time.Duration, success bool) {
+		if accountID != "" {
+			collector.Record(accountID, 0, 1) // Bytes recording would need more hooks in handleRequest
+		}
+	})
 
 	// Register health checks
 	healthChecker.RegisterCheck("connections", func() health.Check {
@@ -228,6 +238,30 @@ func main() {
 	combinedMux.Handle("/health", healthMux)
 	combinedMux.Handle("/health/", healthMux)
 	combinedMux.Handle("/metrics", promhttp.Handler())
+	combinedMux.HandleFunc("/api/internal/disconnect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			AccountID string `json:"account_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+		if req.AccountID == "" {
+			http.Error(w, "Account ID is required", http.StatusBadRequest)
+			return
+		}
+		count := connManager.DisconnectAccount(req.AccountID)
+		log.Printf("Disconnected %d active connections for account %s", count, req.AccountID)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"count":   count,
+		})
+	})
 	combinedMux.Handle("/", db)
 
 	dashboardServer := &http.Server{
@@ -398,7 +432,11 @@ func handleAgentConnection(
 	connID := fmt.Sprintf("%s-%d", agentID, time.Now().UnixNano())
 
 	// Register connection
-	registeredConn, err := connManager.RegisterConnection(connID, agentID, "legacy-account", conn, metadata)
+	accountID := metadata["account_id"]
+	if accountID == "" {
+		accountID = "legacy-account"
+	}
+	registeredConn, err := connManager.RegisterConnection(connID, agentID, accountID, conn, metadata)
 	if err != nil {
 		log.Printf("Failed to register connection: %v", err)
 		return
